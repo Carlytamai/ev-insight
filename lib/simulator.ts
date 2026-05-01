@@ -3,9 +3,10 @@ export type ChargerKind = "normal" | "rapid";
 export type ChargerLine = {
   kind: ChargerKind;
   count: number;
+  unitCost: number;
 };
 
-export type SimulatorInput = {
+export type Scenario = {
   lines: ChargerLine[];
   subsidyEnabled: boolean;
   subsidyRate: number;
@@ -16,54 +17,58 @@ export type SimulatorInput = {
   daysPerMonth: number;
 };
 
-export type ChargerSpec = {
-  label: string;
-  unitCost: number;
-  kwPerCharge: number;
+export type SimulatorInput = {
+  ours: Scenario;
+  rival: Scenario;
+  compareMode: boolean;
 };
 
-export const CHARGER_SPECS: Record<ChargerKind, ChargerSpec> = {
-  normal: { label: "普通充電（6kW想定）", unitCost: 600_000, kwPerCharge: 12 },
-  rapid: { label: "急速充電（50kW想定）", unitCost: 4_500_000, kwPerCharge: 20 },
+export const CHARGER_LABEL: Record<ChargerKind, string> = {
+  normal: "普通充電（〜6kW）",
+  rapid: "急速充電（50kW級）",
 };
 
-export type SimulatorResult = {
+export type ScenarioResult = {
   initialCostGross: number;
   subsidyAmount: number;
   initialCostNet: number;
   monthlyFixedCost: number;
   netRevenuePerCharge: number;
   minChargesPerDay: number;
+  minChargesPerPortPerDay: number;
   minVisitorsPerDay: number;
   totalChargers: number;
 };
 
-export function simulate(input: SimulatorInput): SimulatorResult {
-  const totalChargers = input.lines.reduce((acc, l) => acc + l.count, 0);
+export function simulateScenario(s: Scenario): ScenarioResult {
+  const totalChargers = s.lines.reduce((acc, l) => acc + l.count, 0);
 
-  const initialCostGross = input.lines.reduce(
-    (acc, l) => acc + CHARGER_SPECS[l.kind].unitCost * l.count,
+  const initialCostGross = s.lines.reduce(
+    (acc, l) => acc + l.unitCost * l.count,
     0,
   );
 
-  const subsidyAmount = input.subsidyEnabled
-    ? Math.floor(initialCostGross * input.subsidyRate)
+  const subsidyAmount = s.subsidyEnabled
+    ? Math.floor(initialCostGross * s.subsidyRate)
     : 0;
 
   const initialCostNet = initialCostGross - subsidyAmount;
 
   const monthlyFixedCost =
-    input.monthlyBasicFeeIncrease + input.monthlyMaintenanceFee;
+    s.monthlyBasicFeeIncrease + s.monthlyMaintenanceFee;
 
-  const netRevenuePerCharge = input.pricePerCharge;
+  const netRevenuePerCharge = s.pricePerCharge;
 
   const minChargesPerMonth =
     netRevenuePerCharge > 0 ? monthlyFixedCost / netRevenuePerCharge : 0;
-  const minChargesPerDay = minChargesPerMonth / input.daysPerMonth;
+  const minChargesPerDay = minChargesPerMonth / s.daysPerMonth;
+
+  const minChargesPerPortPerDay =
+    totalChargers > 0 ? minChargesPerDay / totalChargers : 0;
 
   const minVisitorsPerDay =
-    input.facilityArpu > 0
-      ? monthlyFixedCost / input.facilityArpu / input.daysPerMonth
+    s.facilityArpu > 0
+      ? monthlyFixedCost / s.facilityArpu / s.daysPerMonth
       : 0;
 
   return {
@@ -73,18 +78,36 @@ export function simulate(input: SimulatorInput): SimulatorResult {
     monthlyFixedCost,
     netRevenuePerCharge,
     minChargesPerDay,
+    minChargesPerPortPerDay,
     minVisitorsPerDay,
     totalChargers,
   };
 }
 
 export function formatYen(n: number): string {
+  if (!Number.isFinite(n)) return "—";
   return `¥${Math.round(n).toLocaleString("ja-JP")}`;
 }
 
 export function formatNumber(n: number, digits = 1): string {
+  if (!Number.isFinite(n)) return "—";
   return n.toLocaleString("ja-JP", {
     maximumFractionDigits: digits,
     minimumFractionDigits: digits,
   });
+}
+
+export function formatSignedYen(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  const sign = n > 0 ? "+" : n < 0 ? "−" : "";
+  return `${sign}¥${Math.abs(Math.round(n)).toLocaleString("ja-JP")}`;
+}
+
+export function formatSignedNumber(n: number, digits = 1): string {
+  if (!Number.isFinite(n)) return "—";
+  const sign = n > 0 ? "+" : n < 0 ? "−" : "";
+  return `${sign}${Math.abs(n).toLocaleString("ja-JP", {
+    maximumFractionDigits: digits,
+    minimumFractionDigits: digits,
+  })}`;
 }

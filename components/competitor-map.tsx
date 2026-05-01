@@ -49,6 +49,7 @@ export function CompetitorMap() {
     REGION_PRESETS.find((r) => r.id === presetId) ?? REGION_PRESETS[0];
 
   const [customChargers, setCustomChargers] = useState<ChargerSpot[]>([]);
+  const [customCompetitors, setCustomCompetitors] = useState<Facility[]>([]);
   const [loadingCustom, setLoadingCustom] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [selection, setSelection] = useState<Selection>(null);
@@ -59,8 +60,17 @@ export function CompetitorMap() {
   }>({ rapid: true, normal: true, competitors: true });
 
   const region: DisplayedRegion = customLocation
-    ? buildCustomRegion(customLocation, customChargers)
+    ? buildCustomRegion(customLocation, customChargers, customCompetitors)
     : presetToRegion(preset);
+
+  // 住所検索モード切替・対象座標変更時、前回エリアの結果を即座にクリア
+  // （新しいfetchが返るまで古いカウントを表示し続ける問題の解消）
+  useEffect(() => {
+    if (!customLocation) return;
+    setCustomChargers([]);
+    setCustomCompetitors([]);
+    setSearchError(null);
+  }, [customLocation?.lat, customLocation?.lng]);
 
   useEffect(() => {
     setSelection(null);
@@ -95,7 +105,7 @@ export function CompetitorMap() {
   }
 
   return (
-    <APIProvider apiKey={apiKey} libraries={["places"]}>
+    <APIProvider apiKey={apiKey} libraries={["places"]} version="weekly">
       <div className="grid gap-6 lg:grid-cols-[1fr_320px]">
         <div className="space-y-3">
           <SearchBar
@@ -165,8 +175,7 @@ export function CompetitorMap() {
                     </AdvancedMarker>
                   ))}
 
-              {region.source === "preset" &&
-                filter.competitors &&
+              {filter.competitors &&
                 region.competitors.map((f) => (
                   <AdvancedMarker
                     key={f.id}
@@ -190,18 +199,19 @@ export function CompetitorMap() {
               )}
 
               {customLocation && (
-                <NearbyChargerLoader
+                <NearbyDataLoader
                   center={customLocation}
                   onLoadStart={() => {
                     setLoadingCustom(true);
                     setSearchError(null);
                   }}
-                  onLoaded={(chargers) => {
+                  onLoaded={({ chargers, competitors }) => {
                     setCustomChargers(chargers);
+                    setCustomCompetitors(competitors);
                     setLoadingCustom(false);
-                    if (chargers.length === 0) {
+                    if (chargers.length === 0 && competitors.length === 0) {
                       setSearchError(
-                        "このエリアでは充電スポットが見つかりませんでした。",
+                        "このエリアでは充電スポット・競合施設が見つかりませんでした。",
                       );
                     }
                   }}
@@ -324,7 +334,7 @@ export function CompetitorMap() {
             </p>
             {region.source === "custom" && (
               <p className="mt-2 text-[10px] text-muted-foreground">
-                ※ 種別判定は名称からの推定。実装後の現地確認を推奨。
+                ※ Google Places の出力 kW 情報で判定（22kW以上=急速）。未公開の場合は普通扱い。
               </p>
             )}
           </div>
@@ -346,16 +356,14 @@ export function CompetitorMap() {
                 onChange={(v) => setFilter((f) => ({ ...f, normal: v }))}
                 dot="#2563EB"
               />
-              {region.source === "preset" && (
-                <Toggle
-                  label="競合施設"
-                  checked={filter.competitors}
-                  onChange={(v) =>
-                    setFilter((f) => ({ ...f, competitors: v }))
-                  }
-                  dot="#71717A"
-                />
-              )}
+              <Toggle
+                label="競合施設"
+                checked={filter.competitors}
+                onChange={(v) =>
+                  setFilter((f) => ({ ...f, competitors: v }))
+                }
+                dot="#71717A"
+              />
             </div>
           </div>
         </aside>
@@ -429,7 +437,44 @@ function MapRecenter({ center }: { center: { lat: number; lng: number } }) {
   return null;
 }
 
-function NearbyChargerLoader({
+type EvChargeOptions = {
+  connectorCount?: number;
+  connectorAggregations?: Array<{
+    count?: number;
+    maxChargeRateKw?: number;
+  }>;
+};
+
+function readEvCharge(p: unknown): EvChargeOptions | undefined {
+  return (p as { evChargeOptions?: EvChargeOptions }).evChargeOptions;
+}
+
+function readLatLng(loc: unknown): { lat: number; lng: number } | null {
+  if (!loc) return null;
+  const obj = loc as { lat?: unknown; lng?: unknown };
+  const lat =
+    typeof obj.lat === "function"
+      ? (obj.lat as () => number)()
+      : (obj.lat as number);
+  const lng =
+    typeof obj.lng === "function"
+      ? (obj.lng as () => number)()
+      : (obj.lng as number);
+  if (typeof lat !== "number" || typeof lng !== "number") return null;
+  return { lat, lng };
+}
+
+const PRIMARY_TYPE_TO_FACILITY: Record<
+  string,
+  Facility["type"]
+> = {
+  shopping_mall: "mall",
+  supermarket: "supermarket",
+  lodging: "hotel",
+  hotel: "hotel",
+};
+
+function NearbyDataLoader({
   center,
   onLoadStart,
   onLoaded,
@@ -437,62 +482,182 @@ function NearbyChargerLoader({
 }: {
   center: CustomLocation;
   onLoadStart: () => void;
-  onLoaded: (chargers: ChargerSpot[]) => void;
+  onLoaded: (data: {
+    chargers: ChargerSpot[];
+    competitors: Facility[];
+  }) => void;
   onError: (msg: string) => void;
 }) {
-  const map = useMap();
   const places = useMapsLibrary("places");
-  const lastKeyRef = useRef<string>("");
+  // コールバックは ref に格納して effect の依存から外す
+  // （親再レンダリングで in-flight fetch がキャンセルされる問題の解消）
+  const cbRef = useRef({ onLoadStart, onLoaded, onError });
+  cbRef.current = { onLoadStart, onLoaded, onError };
 
   useEffect(() => {
-    if (!map || !places) return;
-    const key = `${center.lat.toFixed(5)}_${center.lng.toFixed(5)}`;
-    if (lastKeyRef.current === key) return;
-    lastKeyRef.current = key;
+    if (!places) return;
+    let cancelled = false;
+    cbRef.current.onLoadStart();
 
-    onLoadStart();
-    const service = new places.PlacesService(map);
-    service.nearbySearch(
-      {
-        location: { lat: center.lat, lng: center.lng },
-        radius: 1500,
-        type: "electric_vehicle_charging_station",
-      },
-      (results, status) => {
-        if (
-          status === places.PlacesServiceStatus.ZERO_RESULTS ||
-          !results ||
-          results.length === 0
-        ) {
-          onLoaded([]);
+    (async () => {
+      try {
+        const PlaceCtor = (
+          places as unknown as {
+            Place: typeof google.maps.places.Place;
+          }
+        ).Place;
+        if (!PlaceCtor || typeof PlaceCtor.searchNearby !== "function") {
+          cbRef.current.onError(
+            "Places API (New) が有効になっていません。GCPで有効化してください。",
+          );
           return;
         }
-        if (status !== places.PlacesServiceStatus.OK) {
-          onError(`検索に失敗しました（${status}）`);
-          return;
-        }
-        const chargers: ChargerSpot[] = results
-          .slice(0, 30)
-          .map((r, i): ChargerSpot | null => {
-            const loc = r.geometry?.location;
-            if (!loc) return null;
-            const name = r.name ?? "充電スポット";
-            const isRapid =
-              /急速|rapid|fast|高速|chademo|quick|chaoji|超急速/i.test(name);
-            return {
-              id: r.place_id ?? `r${i}`,
-              type: isRapid ? "rapid" : "normal",
-              name,
-              lat: loc.lat(),
-              lng: loc.lng(),
-              ports: 1,
+
+        // 充電器: 4象限オフセット検索（半径900m × 4回）で最大80件
+        const OFFSET = 0.004;
+        const RADIUS = 900;
+        const quadrants = [
+          { lat: center.lat + OFFSET, lng: center.lng + OFFSET },
+          { lat: center.lat + OFFSET, lng: center.lng - OFFSET },
+          { lat: center.lat - OFFSET, lng: center.lng + OFFSET },
+          { lat: center.lat - OFFSET, lng: center.lng - OFFSET },
+        ];
+        const chargerFields = [
+          "displayName",
+          "location",
+          "evChargeOptions",
+          "id",
+        ];
+        const competitorFields = [
+          "displayName",
+          "location",
+          "primaryType",
+          "evChargeOptions",
+          "id",
+        ];
+
+        const [chargerResults, competitorResult] = await Promise.all([
+          Promise.all(
+            quadrants.map((q) =>
+              PlaceCtor.searchNearby({
+                fields: chargerFields,
+                locationRestriction: { center: q, radius: RADIUS },
+                includedPrimaryTypes: ["electric_vehicle_charging_station"],
+                maxResultCount: 20,
+              }).catch(() => ({ places: [] as google.maps.places.Place[] })),
+            ),
+          ),
+          PlaceCtor.searchNearby({
+            fields: competitorFields,
+            locationRestriction: {
+              center: { lat: center.lat, lng: center.lng },
+              radius: 1500,
+            },
+            includedPrimaryTypes: [
+              "shopping_mall",
+              "supermarket",
+              "lodging",
+            ],
+            maxResultCount: 20,
+          }).catch(() => ({ places: [] as google.maps.places.Place[] })),
+        ]);
+
+        if (cancelled) return;
+
+        // 充電器マージ
+        const chargers: Record<string, ChargerSpot> = {};
+        for (const r of chargerResults) {
+          for (const p of r.places ?? []) {
+            const id = p.id;
+            if (!id || chargers[id]) continue;
+            const ll = readLatLng(p.location);
+            if (!ll) continue;
+
+            const ev = readEvCharge(p);
+            const aggregations = ev?.connectorAggregations ?? [];
+            const maxKw = aggregations.reduce(
+              (acc, a) =>
+                typeof a.maxChargeRateKw === "number"
+                  ? Math.max(acc, a.maxChargeRateKw)
+                  : acc,
+              0,
+            );
+            const ports =
+              ev?.connectorCount ??
+              aggregations.reduce((acc, a) => acc + (a.count ?? 0), 0) ??
+              0;
+
+            chargers[id] = {
+              id,
+              type: maxKw >= 22 ? "rapid" : "normal",
+              name:
+                (p as unknown as { displayName?: string }).displayName ??
+                "充電スポット",
+              lat: ll.lat,
+              lng: ll.lng,
+              ports: ports || 1,
+              maxKw: maxKw > 0 ? maxKw : undefined,
             };
-          })
-          .filter((c): c is ChargerSpot => c !== null);
-        onLoaded(chargers);
-      },
-    );
-  }, [map, places, center.lat, center.lng, onLoadStart, onLoaded, onError]);
+          }
+        }
+
+        // 競合施設マージ
+        const competitors: Facility[] = [];
+        const seenComp: Record<string, true> = {};
+        for (const p of competitorResult.places ?? []) {
+          const id = p.id;
+          if (!id || seenComp[id]) continue;
+          seenComp[id] = true;
+          const ll = readLatLng(p.location);
+          if (!ll) continue;
+
+          const primaryType =
+            (p as unknown as { primaryType?: string }).primaryType ?? "";
+          const facilityType =
+            PRIMARY_TYPE_TO_FACILITY[primaryType] ?? "office";
+
+          const ev = readEvCharge(p);
+          const hasCharger = !!ev && (ev.connectorCount ?? 0) > 0;
+          const compMaxKw = (ev?.connectorAggregations ?? []).reduce(
+            (acc, a) =>
+              typeof a.maxChargeRateKw === "number"
+                ? Math.max(acc, a.maxChargeRateKw)
+                : acc,
+            0,
+          );
+
+          competitors.push({
+            id,
+            type: facilityType,
+            name:
+              (p as unknown as { displayName?: string }).displayName ??
+              "施設",
+            lat: ll.lat,
+            lng: ll.lng,
+            hasCharger,
+            chargerType: hasCharger
+              ? compMaxKw >= 22
+                ? "rapid"
+                : "normal"
+              : undefined,
+          });
+        }
+
+        cbRef.current.onLoaded({
+          chargers: Object.values(chargers),
+          competitors,
+        });
+      } catch (e) {
+        if (cancelled) return;
+        const msg = e instanceof Error ? e.message : String(e);
+        cbRef.current.onError(`検索に失敗しました: ${msg}`);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [places, center.lat, center.lng]);
 
   return null;
 }
@@ -578,7 +743,7 @@ function SelectionDetail({ selection }: { selection: NonNullable<Selection> }) {
         </p>
         <p className="text-sm font-semibold text-zinc-900">{c.name}</p>
         <p className="text-xs text-zinc-600">
-          推定充電口数: {c.ports} 口
+          {c.maxKw ? `最大 ${c.maxKw} kW` : "出力情報なし"} / 推定 {c.ports} 口
         </p>
       </div>
     );

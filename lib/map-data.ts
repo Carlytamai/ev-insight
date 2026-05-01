@@ -8,6 +8,7 @@ export type ChargerSpot = {
   lat: number;
   lng: number;
   ports: number;
+  maxKw?: number;
 };
 
 export type Facility = {
@@ -101,6 +102,7 @@ export type DisplayedRegion = {
 export function buildCustomRegion(
   loc: CustomLocation,
   chargers: ChargerSpot[],
+  competitors: Facility[] = [],
 ): DisplayedRegion {
   return {
     source: "custom",
@@ -115,7 +117,7 @@ export function buildCustomRegion(
       hasCharger: false,
     },
     chargers,
-    competitors: [],
+    competitors,
   };
 }
 
